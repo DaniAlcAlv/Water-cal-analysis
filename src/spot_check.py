@@ -38,11 +38,11 @@ List of Errors that can be detected:
   - Interval_average (List with the results from dividing: measured_weigth/n for each reading) is null or not a mapping, or if it has fewer than 2 points
   - Invalid interval keys or values (negatives or non-numeric)
   - Less than 2 entries in measurements
-  - Non‑positive valve_open_interval, valve_open_time, or water_weight data
+  - Non-positive valve_open_interval, valve_open_time, or water_weight data
 
 - Data Consistency (measurement vs. output)
   - Missing interval_average entry for a measured valve_open_time
-  - Non‑positive interval_average value
+  - Non-positive interval_average value
   - Inconsistent interval_average vs expected (from water_weight averages / repeat_count)
   - Reported vs recomputed regression mismatch (slope/offset/r2 beyond tolerance)
 
@@ -56,6 +56,8 @@ import json
 import math
 import re
 import sys
+import matplotlib.pyplot as plt
+import numpy as np
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Annotated, Mapping
 from pydantic import BaseModel, ValidationError, field_validator, Field
@@ -401,6 +403,88 @@ class WaterCalData:
                 f"Slope value ({slope:.6f}) close to out of bounds ({self.SLOPE_MIN:.6f} - {self.SLOPE_MAX:.6f}))"
             )
 
+    # --- Plotting ---
+    def plot_weight_vs_opentime(self, show_slope_band: bool = True):
+        """
+        Plot weight vs valve open time using self.weight_per_valve_opentime, with fitted regression line.
+
+        Parameters
+        ----------
+        save_path : str | Path | None
+            If provided, saves the figure to this path.
+        show_slope_band : bool
+            If True, shades y-values implied by slope bounds to visualize acceptable range.
+
+        Returns
+        -------
+        (fig, ax) : tuple
+            Matplotlib Figure and Axes objects.
+        """
+
+        # Sort by open time
+        x, y = map(list, zip(*sorted(self.weight_per_valve_opentime.items())))  # x: open time, y: weight
+        x_arr = np.asarray(x, dtype=float)
+        y_arr = np.asarray(y, dtype=float)
+
+        # Coefficients to display/use
+        slope, offset, r2 = self.preferred_coefficients
+
+        # --- Matplotlib setup
+        fig, ax = plt.subplots(figsize=(7.5, 5.0), dpi=120)
+        point_kwargs = dict(s=50, color="C0", edgecolor="white", linewidth=0.75, alpha=0.9, zorder=3)
+        line_kwargs = dict(color="C3", lw=2.25, alpha=0.95, zorder=2)
+
+        # --- Scatter points
+        ax.scatter(x_arr, y_arr, **point_kwargs, label="Measured points")
+
+        # --- Regression line over the data domain
+        x_line = np.linspace(float(min(x_arr)), float(max(x_arr)), 200)
+        y_line = offset + slope * x_line
+        ax.plot(x_line, y_line, **line_kwargs, label=f"Fit: W = {slope:.5f}·t + {offset:.5f}  (R²={r2:.3f})")
+
+        # --- Also plot the originally reported points and regression if it differs
+        if self.different_recalculated_output:
+            # Regression
+            s0 = self.calibration_output.slope
+            o0 = self.calibration_output.offset
+            r20 = self.calibration_output.r2
+            y_line0 = o0 + s0 * x_line
+            ax.plot(
+                x_line, y_line0, color="C1", lw=1.8, ls="--", alpha=0.9, 
+                label=f"Original: W = {s0:.5f}·t + {o0:.5f}  (R²={r20:.3f})"
+                )
+            # Points from interval average
+            x0, y0 = map(list, zip(*sorted(self.calibration_output.interval_average.items())))
+            x0_arr = np.asarray(x0, dtype=float)
+            y0_arr = np.asarray(y0, dtype=float)
+            ax.scatter(
+                x0_arr, y0_arr, s=40, color="C1", edgecolor="black", 
+                linewidth=0.6, alpha=0.7, marker="D", label="Original interval_average"
+                )
+
+        # --- Optional slope-bounds band (visual hint only)
+        if show_slope_band and math.isfinite(self.SLOPE_MIN) and math.isfinite(self.SLOPE_MAX):
+            # Shade the y-range computed by applying slope bounds around the same offset.
+            y_min_band = offset + self.SLOPE_MIN * x_line
+            y_max_band = offset + self.SLOPE_MAX * x_line
+            ax.fill_between(
+                x_line, y_min_band, y_max_band,
+                color="C2", alpha=0.08, label=f"Slope band [{self.SLOPE_MIN:.3f}, {self.SLOPE_MAX:.3f}]"
+            )
+
+        # --- Axis labels, title, grid and legend
+        ax.set_xlabel("Valve open time (t)", fontsize=11)
+        ax.set_ylabel("Water weight (W)", fontsize=11)
+        title = f"{self.file_path.stem} — Weight vs Valve Open Time"
+        ax.set_title(title, fontsize=12, pad=10)
+        ax.grid(True, which="both", ls="--", lw=0.6, alpha=0.35)
+        ax.legend(frameon=True)
+
+        # --- Tight layout and show
+        fig.tight_layout()
+        plt.show()
+
+        return fig, ax
 
 # ---------- Discovery ----------
 def load_watercaldata(main_dir: Path) -> List[WaterCalData]:
@@ -619,6 +703,7 @@ def interactive_app(main_dir: Optional[Path] = None):
 
         rig_num, record = flat[idx - 1]
         print(repr(record))
+        record.plot_weight_vs_opentime()
         prompt_volume_and_calculate(record)
 
 
