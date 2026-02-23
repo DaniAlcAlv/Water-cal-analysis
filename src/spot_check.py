@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
 """
-Interactive config browser (rig-first).
+Water calibration browser with error detection and a calculator: Water Volume (uL) -> Solenoid open time (ms) if the valvolume is in the calibrated range.
 
-- Directory layout:
+Goes through a directory with this layout:
     main_dir/
         <computer_name_1>/
             config_a.json
@@ -10,14 +9,15 @@ Interactive config browser (rig-first).
         <computer_name_2>/
             config_c.json
             ...
-- Each JSON minimal shape:
+
+- And collects from each JSON file:
 {
   "computer_name": str,
   "rig_name": str,           # e.g., "5A", "12A", "12B"
   "calibration": {
     "water_valve": {
       "output": {
-        "interval_average": { str(float): float, ... },
+        "interval_average": { str(float): float, ... }, 
         "slope": float,
         "offset": float,
         "r2": float
@@ -25,246 +25,606 @@ Interactive config browser (rig-first).
     }
   }
 }
+
+
+List of Errors that can be detected:
+
+- Load/Parse
+  - Skipped file due to read/JSON error: "[ERROR] Skipping <file>: <exception>"
+  - Schema validation failure: "[ERROR] Invalid calibration file: <file>. <ValidationError>"
+
+- Schema/Content (Pydantic)
+  - If the repeat count (n) of a mesurement is 20 or less
+  - Interval_average (List with the results from dividing: measured_weigth/n for each reading) is null or not a mapping, or if it has fewer than 2 points
+  - Invalid interval keys or values (negatives or non-numeric)
+  - Less than 2 entries in measurements
+  - Non‑positive valve_open_interval, valve_open_time, or water_weight data
+
+- Data Consistency (measurement vs. output)
+  - Missing interval_average entry for a measured valve_open_time
+  - Non‑positive interval_average value
+  - Inconsistent interval_average vs expected (from water_weight averages / repeat_count)
+  - Reported vs recomputed regression mismatch (slope/offset/r2 beyond tolerance)
+
+- Regression Quality
+  - Poor fit: r2 < limit
+  - Offset too large relative to slope 
+  - Slope out of usual bounds (too big or small)
 """
 
 import json
+import math
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
+from typing import Any, Dict, List, Optional, Tuple, Annotated, Mapping
+from pydantic import BaseModel, ValidationError, field_validator, Field
 
 # ---------- Configuration ----------
-DEFAULT_MAIN_DIR = Path("F:\Data\Rig 2026-2-19")  
+DEFAULT_MAIN_DIR = Path(r"F:\Data\Rig 2026-2-19")
+MENU_WIDTH = 100 
+
+# ---------- Regression Utilities ----------
+def linear_regression(x: List[float], y: List[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    n = len(x)
+    if n < 2:
+        return None, None, None
+
+    mean_x = sum(x) / n
+    mean_y = sum(y) / n
+
+    ss_xy = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
+    ss_xx = sum((xi - mean_x) ** 2 for xi in x)
+    if ss_xx == 0:
+        return None, None, None
+
+    b = ss_xy / ss_xx
+    a = mean_y - b * mean_x
+
+    ss_res = sum((yi - (a + b * xi)) ** 2 for xi, yi in zip(x, y))
+    ss_tot = sum((yi - mean_y) ** 2 for yi in y)
+
+    r2 = 1 - ss_res / ss_tot if ss_tot != 0 else (1.0 if ss_res == 0 else 0.0)
+    return b, a, r2
 
 
-# ---------- Data structure ----------
-class ConfigRecord:
-    def __init__(self, file_path: Path, data: Dict[str, Any]):
-        self.file_path = file_path
-        self.data = data
+# ---------- Pydantic Models ----------
+PosFloat = Annotated[float, Field(gt=0)]  # Positive number
 
-    @property
-    def computer_name(self) -> Optional[str]:
-        return self.data.get("computer_name")
 
-    @property
-    def rig_name(self) -> Optional[str]:
-        return self.data.get("rig_name")
+class Measurement(BaseModel):
+    valve_open_interval: PosFloat
+    valve_open_time: PosFloat
+    water_weight: List[PosFloat]
+    repeat_count: int = Field(gt=20)
 
-    def get_water_valve_output(self) -> Dict[str, Any]:
-        calib = self.data.get("calibration") or {}
-        wv = (calib.get("water_valve") or {}).get("output") or {}
-        return wv
 
-    def compact_line(self) -> str:
-        """One-line summary for list view under a rig."""
-        comp = self.computer_name or "<missing computer>"
-        wv = self.get_water_valve_output()
-        slope = wv.get("slope")
-        offset = wv.get("offset")
-        # Render key stats compactly; guard Nones
-        def fmt(v):
-            if isinstance(v, (int, float)):
-                return f"{v:.4g}"
-            return str(v) if v is not None else "NA"
-        return f"Computer: {comp:<20} | File: {self.file_path.name:<30} | slope={fmt(slope)}, offset={fmt(offset)}"
+class CalibrationInput(BaseModel):
+    measurements: List[Measurement] = Field(min_length=2)
 
-    def summary(self) -> str:
-        """Full details for a selected file."""
-        comp = self.computer_name or "<missing>"
-        rig = self.rig_name or "<missing>"
-        wv = self.get_water_valve_output()
 
-        slope = wv.get("slope")
-        offset = wv.get("offset")
-        r2 = wv.get("r2")
-        interval_avg = wv.get("interval_average") or {}
+class RegressionResult(BaseModel):
+    slope: float
+    offset: float
+    r2: float
+    slope_ok: bool
+    offset_ok: bool
+    r2_ok: bool
 
-        # Parse interval_average keys to float when possible and sort
-        pairs: List[Tuple[Any, Any]] = []
-        for k, v in interval_avg.items():
+
+class CalibrationOutput(BaseModel):
+    interval_average: Dict[PosFloat, PosFloat]
+    slope: float
+    offset: float
+    r2: float
+
+    @field_validator("interval_average", mode="before")
+    @classmethod
+    def convert_and_validate_keys(cls, v: Any):
+        if v is None:
+            raise ValueError("interval_average cannot be null; expected a mapping of {open_time: weight}.")
+        if not isinstance(v, Mapping):
+            raise TypeError(f"interval_average must be a mapping (dict-like), got {type(v).__name__}.")
+
+        converted: Dict[PosFloat, PosFloat] = {}
+
+        for key, value in v.items():
+            # Convert and validate key (interval/time)
             try:
-                fk = float(k)
-                pairs.append((fk, v))
-            except (ValueError, TypeError):
-                pairs.append((k, v))
+                k = float(key)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid interval key: {key!r} (not a number)")
+            if not math.isfinite(k) or k <= 0:
+                raise ValueError(f"Invalid interval key: {key!r} (must be positive and finite)")
 
-        def sort_key(item):
-            k, _ = item
-            return (0, k) if isinstance(k, float) else (1, str(k))
+            # Convert and validate value (weight/volume)
+            if not isinstance(value, (int, float)):
+                raise TypeError(f"Weight for interval {key!r} must be a number, got {type(value).__name__}")
+            val = float(value)
+            if not math.isfinite(val) or val <= 0:
+                raise ValueError(f"Invalid weight for interval {key!r}: {value!r} (must be positive and finite)")
+            converted[k] = val
 
-        pairs.sort(key=sort_key)
+        if len(converted) < 2:
+            raise ValueError("interval_average must contain at least 2 points for regression.")
 
-        interval_lines = []
-        for k, v in pairs:
-            disp_k = f"{k:.6g}" if isinstance(k, float) else str(k)
-            interval_lines.append(f"      {disp_k}: {v}")
+        return converted
 
-        interval_block = "\n".join(interval_lines) if interval_lines else "      <none>"
+
+class WaterValveCalibration(BaseModel):
+    date: Optional[str]
+    input: CalibrationInput
+    output: CalibrationOutput
+
+
+class Calibration(BaseModel):
+    water_valve: WaterValveCalibration
+
+
+# ---------- Root Model ----------
+class WaterCalModel(BaseModel):
+    computer_name: str
+    rig_name: str
+    calibration: Calibration
+
+
+# ---------- Wrapper Class ----------
+class WaterCalData:
+    EQUAL_TOLERANCE = 0.005  # Tolerance for calculating if 2 numbers are the same or not
+    MAX_OFFSET_SLOPE_RATIO = 20
+    MIN_R2, MIN_R2_WARN = 0.980, 0.990
+    SLOPE_MIN, SLOPE_MAX = 0.04, 0.10
+
+    def __init__(self, file_path: Path, raw_data: Dict[str, Any]):
+        try:
+            self._model = WaterCalModel.model_validate(raw_data)
+        except ValidationError as e:
+            print(f"❌ Invalid calibration file: {file_path}. {e}")
+            raise
+
+        self.file_path = file_path
+        self.rig_num: str = self._extract_rig_num(self._model.rig_name)
+
+        self._recomputed: Optional[RegressionResult] = None
+        self._warnings: set[str] = set()
+        self._errors: set[str] = set()
+        self._different_recalculated_output: bool = False
+
+        self.weight_per_valve_opentime: Dict[PosFloat, PosFloat] = self.calibration_output.interval_average
+
+        self._validate_folder_match()
+        self._validate_interval_average_output()
+        self._validate_regression()
+
+    # ---------- Public Properties ----------
+
+    @property
+    def computer_name(self) -> str:
+        return self._model.computer_name
+
+    @property
+    def rig_name(self) -> str:
+        return self._model.rig_name
+
+    @property
+    def date(self) -> Optional[str]:
+        return self._model.calibration.water_valve.date
+
+    @property
+    def measurements(self) -> List[Measurement]:
+        return self._model.calibration.water_valve.input.measurements
+
+    @property
+    def calibration_output(self) -> CalibrationOutput:
+        return self._model.calibration.water_valve.output
+
+    @property
+    def recomputed(self) -> RegressionResult:
+        return self._recomputed
+
+    @property
+    def preferred_coefficients(self) -> Tuple[PosFloat, PosFloat, PosFloat]:
+        if self.different_recalculated_output:  # If errors exist, use recomputed
+            return self._recomputed.slope, self._recomputed.offset, self._recomputed.r2
+        return self.calibration_output.slope, self.calibration_output.offset, self.calibration_output.r2
+
+    @property
+    def warnings(self) -> set[str]:
+        return self._warnings
+
+    @property
+    def errors(self) -> set[str]:
+        return self._errors
+
+    @property
+    def n_warnings(self) -> int:
+        return len(self._warnings)
+
+    @property
+    def n_errors(self) -> int:
+        return len(self._errors)
+
+    @property
+    def different_recalculated_output(self) -> bool:
+        return self._different_recalculated_output
+
+    @property
+    def vol_bounds(self) -> tuple[float, float]:
+        keys = list(self.weight_per_valve_opentime.values())
+        return (min(keys), max(keys))
+
+
+    @staticmethod
+    def _extract_rig_num(rig_name: Optional[str]) -> str:
+        """
+        Returns the leading numeric part of rig_name as a string, or 'Other' if none.
+        Examples: '4C' -> '4', '12B' -> '12', 'EPHYS-5' -> 'Other'
+        """
+        if not rig_name:
+            return "Other"
+        m = re.match(r"^\s*(\d+)", rig_name)
+        return m.group(1) if m else "Other"
+
+
+    def __str__(self) -> str:
+        warn = f" [{self.n_warnings} ⚠️ ]" if self.n_warnings else ""
+        error = f" [{self.n_errors} ❌ ]" if self.n_errors else ""
+        slope, offset, r2 = self.preferred_coefficients
+        date_str = self.date[:10] if self.date else "NoDate"
 
         return (
-            f"File: {self.file_path}\n"
-            f"  Computer: {comp}\n"
-            f"  Rig:      {rig}\n"
-            f"  Calibration.water_valve.output:\n"
-            f"    slope:  {slope}\n"
-            f"    offset: {offset}\n"
-            f"    r2:     {r2}\n"
-            f"    interval_average:\n{interval_block}\n"
+            f"{self.file_path.name[:-5]}  "
+            f"({date_str}) "
+            f"W = {slope:.5f}·t +{offset:.5f} (R2={r2:.3f} )"
+            f"{warn}{error}"
         )
 
+    def __repr__(self) -> str:
+        # Layout constants
+        title = f" Details — {self.rig_name} @ {self.computer_name} "
+        label_w = 10 # Left column label width
 
-# ---------- Discovery & indexing ----------
-def discover_configs(main_dir: Path) -> List[ConfigRecord]:
-    if not main_dir.exists() or not main_dir.is_dir():
-        raise FileNotFoundError(f"Directory not found or not a directory: {main_dir}")
+        # Status badges (optional; uses RegressionResult booleans)
+        s_ok = "\033[92m✓\033[0m" if self.recomputed.slope_ok  else "\033[91m✗\033[0m"
+        o_ok = "\033[92m✓\033[0m" if self.recomputed.offset_ok else "\033[91m✗\033[0m"
+        r_ok = "\033[92m✓\033[0m" if self.recomputed.r2_ok     else "\033[91m✗\033[0m"
 
-    records: List[ConfigRecord] = []
+        # Format rows
+        header   = f"┌{title:─^{MENU_WIDTH-2}}┐"
+        file_row = f"│ {'File:':<{label_w}} {self.file_path}".ljust(MENU_WIDTH-1) + "│"
+        date_row = f"│ {'Date:':<{label_w}} {self.date}".ljust(MENU_WIDTH-1) + "│"
+        spacer   = f"├{'─'*(MENU_WIDTH-2)}" + "┤"
+        footer   = f"└{'':─^{MENU_WIDTH-2}}┘"
+        
+        orig_row = (
+            f"│ {'Original: ':<{label_w}}  "
+            f"Slope {self.calibration_output.slope:>9.6f}    "
+            f"Offset {self.calibration_output.offset:>9.6f}     "
+            f"R² {self.calibration_output.r2:>5.3f}   "
+        )
+        orig_row = orig_row.ljust(MENU_WIDTH-1) + "│"
+
+        # Recomputed coefficients + status badges
+        recom_row = (
+            f"│ {'Recomputed:':<{label_w}} "
+            f"Slope {self.recomputed.slope:>9.6f} {s_ok}  "
+            f"Offset {self.recomputed.offset:>9.6f} {o_ok}  "
+            f"R² {self.recomputed.r2:>5.3f} {r_ok}   "
+        )
+        recom_row = recom_row.ljust(MENU_WIDTH-1) + "│"
+
+        lines = [header, file_row, date_row, spacer, orig_row, recom_row]
+
+        if self.warnings:
+            lines.extend([spacer, f"│⚠️  WARNINGS".ljust(MENU_WIDTH) + "│"])    
+            for w in self.warnings:
+                lines.append((f"│  - {w}".ljust(MENU_WIDTH-1) + "│"))
+        if self.errors:
+            lines.extend([spacer, f"│ ❌ ERRORS".ljust(MENU_WIDTH)+ "│"])   
+            for e in self.errors:
+                lines.append((f"│  - {e}".ljust(MENU_WIDTH-1) + "│"))
+
+        lines.append(footer)
+
+        return "\n".join(lines)
+
+    # ---------- Validation ----------
+    def _validate_folder_match(self) -> None:
+        folder_name = self.file_path.parent.name
+        if folder_name != self._model.computer_name:
+            self._warnings.add(
+                f"Computer mismatch: folder='{folder_name}' vs json='{self._model.computer_name}'"
+            )
+
+    def _validate_interval_average_output(self) -> None:
+        for m in self.measurements:
+            weight = sum(m.water_weight) / len(m.water_weight)  # In case there are several readings
+            expected_weight = weight / m.repeat_count
+
+            output_weight = self.weight_per_valve_opentime.get(m.valve_open_time)
+
+            if output_weight is None:
+                self._errors.add(f"Missing interval_average entry for valve_open_time={m.valve_open_time}")
+
+            elif output_weight <= 0:
+                self._errors.add(f"Non-positive interval_average value at {m.valve_open_time}: {output_weight}")
+
+            elif math.isclose(output_weight / m.repeat_count, expected_weight, rel_tol=self.EQUAL_TOLERANCE):
+                self._warnings.add("Output error: Weight was not divided by the repeat count when calculating the interval avg")
+                self.weight_per_valve_opentime[m.valve_open_time] = expected_weight
+
+            elif not math.isclose(output_weight, expected_weight, rel_tol=self.EQUAL_TOLERANCE):
+                self._errors.add(
+                    f"Inconsistent interval_average at {m.valve_open_time}: "
+                    f"Expected {expected_weight:.6f}, got {output_weight:.6f}, ratio is {(expected_weight / output_weight):.2}"
+                )
+
+    def _validate_regression(self) -> None:
+        x, y = map(list, zip(*sorted(self.weight_per_valve_opentime.items())))
+        slope, offset, r2 = linear_regression(x, y)
+
+        slope_ok = math.isclose(slope, self.calibration_output.slope, rel_tol=self.EQUAL_TOLERANCE)
+        offset_ok = math.isclose(offset, self.calibration_output.offset, rel_tol=self.EQUAL_TOLERANCE)
+        r2_ok = math.isclose(r2, self.calibration_output.r2, abs_tol=self.EQUAL_TOLERANCE/10)
+
+        self._recomputed = RegressionResult(
+            slope=slope,
+            offset=offset,
+            r2=r2,
+            slope_ok=slope_ok,
+            offset_ok=offset_ok,
+            r2_ok=r2_ok,
+        )
+
+        if not (slope_ok and offset_ok and r2_ok):
+            self._different_recalculated_output = True
+            self._errors.add("Reported regression differs from computed.")
+
+        # --- Quality thresholds ---
+        if r2 < self.MIN_R2:
+            self._errors.add(f"Poor regression fit: r2={r2:.6f} (< {self.MIN_R2})")
+        elif r2 < self.MIN_R2_WARN:
+            self._warnings.add(f"Suboptimal regression fit: r2={r2:.6f} (< {self.MIN_R2_WARN})")
+
+        if abs(offset) > abs(slope) / self.MAX_OFFSET_SLOPE_RATIO:
+            self._errors.add(f"Offset value ({offset:.6f}) quite big compared to the the slope ({slope:.6f})")
+        elif abs(offset) > abs(slope) / (self.MAX_OFFSET_SLOPE_RATIO * 5):
+            self._warnings.add(f"Offset value ({offset:.6f}) too big compared to the the slope ({slope:.6f})")
+
+        s_range = self.SLOPE_MAX - self.SLOPE_MIN
+        if self.SLOPE_MIN > slope or slope > self.SLOPE_MAX:
+            self._errors.add(
+                f"Slope value ({slope:.6f}) out of bounds ({self.SLOPE_MIN:.6f} - {self.SLOPE_MAX:.6f}))"
+            )
+        elif slope < self.SLOPE_MIN + s_range / 5 or slope > self.SLOPE_MAX - s_range / 5:
+            self._warnings.add(
+                f"Slope value ({slope:.6f}) close to out of bounds ({self.SLOPE_MIN:.6f} - {self.SLOPE_MAX:.6f}))"
+            )
+
+
+# ---------- Discovery ----------
+def load_watercaldata(main_dir: Path) -> List[WaterCalData]:
+    records = []
     for comp_dir in sorted(p for p in main_dir.iterdir() if p.is_dir()):
         for cfg in sorted(comp_dir.glob("*.json")):
             try:
                 with cfg.open("r", encoding="utf-8") as f:
                     data = json.load(f)
-                records.append(ConfigRecord(cfg, data))
-            except json.JSONDecodeError as e:
-                print(f"[WARN] Skipping invalid JSON: {cfg} ({e})", file=sys.stderr)
+                records.append(WaterCalData(cfg, data))
             except Exception as e:
-                print(f"[WARN] Error reading {cfg}: {e}", file=sys.stderr)
+                print(f"[ERROR] Skipping {cfg}: {e}")
     return records
 
 
-def rig_sort_key(rig: Optional[str]) -> Tuple[int, int, str]:
-    """
-    Sort rigs by <number><letters>, e.g.:
-      '5A' -> (0, 5, 'A')
-      '12A' -> (0, 12, 'A')
-      '12B' -> (0, 12, 'B')
-    Malformed / missing go to the end.
-    """
-    if not rig or not isinstance(rig, str):
-        return (1, 1_000_000_000, "")  # sentinel
-    rig = rig.strip()
-    m = re.fullmatch(r"(\d+)\s*([A-Za-z]+)", rig)
+def rig_sort_key(rig: Optional[str]):
+    m = re.fullmatch(r"(\d+)\s*([A-Za-z]+)", rig.strip())
     if not m:
-        return (1, 1_000_000_000, rig.upper())
+        return (1, 999_999, rig)
     return (0, int(m.group(1)), m.group(2).upper())
 
 
-def index_by_rig(records: List[ConfigRecord]) -> Dict[str, List[ConfigRecord]]:
-    by_rig: Dict[str, List[ConfigRecord]] = {}
-    for rec in records:
-        rig = rec.rig_name or "(missing)"
-        by_rig.setdefault(rig, []).append(rec)
-
-    # Within each rig, sort by computer then file for stability
-    for rig, lst in by_rig.items():
-        lst.sort(key=lambda r: ((r.computer_name or "").lower(), r.file_path.name.lower()))
+def index_by_rig(records: List[WaterCalData]) -> Dict[str, List[WaterCalData]]:
+    by_rig: Dict[str, List[WaterCalData]] = {}
+    for r in records:
+        by_rig.setdefault(r.rig_name or "(missing)", []).append(r)
+    for lst in by_rig.values():
+        lst.sort(key=lambda r: (r.computer_name or "", r.file_path.name))
     return by_rig
 
 
-# ---------- UI helpers ----------
-def choose_from_list(options: List[str], prompt: str) -> Optional[int]:
-    if not options:
-        print("No options available.")
-        return None
+def group_records_by_rig_num(records: List[WaterCalData]) -> Dict[str, List[WaterCalData]]:
+    """   Groups records by record.rig_num (e.g., '4', '12', or 'Other').   """
+    groups: Dict[str, List[WaterCalData]] = {}
+    for rec in records:
+        key = getattr(rec, "rig_num", "Other") or "Other"
+        groups.setdefault(key, []).append(rec)
 
-    while True:
-        print(prompt)
-        for i, opt in enumerate(options, 1):
-            print(f"  {i:3d}) {opt}")
-        print("    0) Back / Exit")
-        choice = input("Select an option: ").strip()
-        if choice == "0":
-            return None
-        if choice.isdigit():
-            idx = int(choice)
-            if 1 <= idx <= len(options):
-                return idx - 1
-        print("Invalid selection. Please try again.\n")
+    # Sort each group for stable display: by rig_name then by file name
+    for lst in groups.values():
+        lst.sort(key=lambda r: ((r.rig_name or ""), r.file_path.name))
+    return groups
 
 
-# ---------- Custom logic hook ----------
-def perform_custom_logic(record: ConfigRecord) -> None:
-    """
-    Placeholder for your domain logic. Modify as needed.
-    Example: flag low r².
-    """
-    wv = record.get_water_valve_output()
-    r2 = wv.get("r2")
-    if isinstance(r2, (int, float)) and r2 < 0.95:
-        print(f"[NOTE] r²={r2} below 0.98 for {record.file_path.name}")
-    # Add more logic here as needed.
+def ordered_rig_num_keys(groups: Dict[str, List[WaterCalData]]) -> List[str]:
+    """  Returns group keys ordered numerically with 'Other' last. """
+    numeric = [k for k in groups.keys() if k != "Other" and k.isdigit()]
+    numeric_sorted = sorted(numeric, key=lambda s: int(s))
+    return numeric_sorted + (["Other"] if "Other" in groups else [])
 
 
-# ---------- App flow ----------
-def interactive_app(main_dir: Optional[Path] = None) -> None:
-    """
-    Purely interactive flow:
-      1) Ask for rig (from a sorted list; numeric-then-letter)
-      2) Show all files for that rig with compact info
-      3) Let user view full details and run custom logic
-      4) Allow returning to rig list or exiting
-    """
+# ---------- Calculator ----------
+def calc_time_ms_from_vol_ul(uL: float, slope: float, offset: float) -> float:
+    """Uses the regression slope and offset to calculate the valve open time in milliseconds given a volume in microliters"""
+    mL = uL/1000 # conversion because the units from the regression are t in seconds and water vol or weight in mL or g
+    t_sec = (mL - offset) / slope
+    t_ms = t_sec*1000
+    return t_ms
+
+# ---------- UI  ----------
+def prepare_data(main_dir: Optional[Path]) -> Tuple[Path, List[WaterCalData], Dict[str, List[WaterCalData]], List[str]]:
     main_dir = main_dir or DEFAULT_MAIN_DIR
-
-    try:
-        records = discover_configs(main_dir)
-    except Exception as e:
-        print(f"Error discovering configs in {main_dir}: {e}", file=sys.stderr)
-        return
-
-    if not records:
-        print("No config files discovered. Nothing to show.")
-        return
-
+    records = load_watercaldata(main_dir)
     rigs_index = index_by_rig(records)
-    rig_names_sorted = sorted(rigs_index.keys(), key=rig_sort_key)
+    rig_names = sorted(rigs_index.keys(), key=rig_sort_key)
+    return main_dir, records, rigs_index, rig_names
+
+
+def build_flat_menu(
+    rig_names: List[str],
+    rigs_index: Dict[str, List[WaterCalData]],
+) -> List[Tuple[str, WaterCalData]]:
+    """
+    Builds a flat list of (rig_name, record) in a stable order
+    for display and selection.
+    """
+    flat: List[Tuple[str, WaterCalData]] = []
+    for rig in rig_names:
+        for record in rigs_index[rig]:
+            flat.append((rig, record))
+    return flat
+
+
+def render_main_menu_grouped_by_rig_num(records: List[WaterCalData]) -> List[Tuple[str, WaterCalData]]:
+    """
+    Prints a grouped (by rig_num), single-level menu and returns a flat
+    list mapping (rig_num, record) for selection (1..N).
+    """
+    # Box layout
+    title = " WATER CALIBRATIONS FOUND IN RIG JSONS"
+    header = f"┌{title:─^{MENU_WIDTH-2}}┐"
+    footer = f"└{'':─^{MENU_WIDTH-2}}┘"
+
+    def row(text: str = "") -> str:
+        return f"│ {text.ljust(MENU_WIDTH-3)}│"
+
+    def section_title(rig_num: str, count: int) -> str:
+        # e.g., "Rigs 4x (N files)" or "Other Rigs (N files)"
+        if rig_num == "Other":
+            return f"{f"├─Other Rigs───({count} file{'s' if count != 1 else ''})":─<{MENU_WIDTH-1}}┤"
+        # You can choose either "Rigs 4x" or just "Rigs 4"; keeping it clean:
+        return f"{f"├─Rigs {rig_num}───({count} file{'s' if count != 1 else ''})":─<{MENU_WIDTH-1}}┤"
+
+    def entry_line(idx: int, rec: WaterCalData) -> str:
+        c_lengths = [8 , 40, 10] #Max char len of the info (0:warnings 1:Formula 2:Date)
+        label = rec.file_path.stem
+
+        warn = f"{"\033[93m"}[{rec.n_warnings}!]{"\033[0m"}" if rec.n_warnings else "."*4
+        err  = f"{"\033[91m"}[{rec.n_errors}!]{"\033[0m"}"   if rec.n_errors   else "."*4
+        badges = f"{(warn + err) if (warn or err) else '':.^{c_lengths[0]}}"
+
+        formula = f"W= {rec.calibration_output.slope:0.5f}·t{rec.calibration_output.offset:+0.5f}..(R2={rec.calibration_output.r2:0.3f})"
+        date_str = (rec.date[:10] if rec.date else "NoDate")
+
+        left_col = f"{idx:>4}) {label:.<{MENU_WIDTH-sum(c_lengths)-9}}"
+        right_col = f"{badges}{formula:.^{c_lengths[1]}}{date_str:.>{c_lengths[2]}}"
+
+        line = f"{left_col}{right_col}"
+
+        return row(line)
+
+    # Group and order
+    groups = group_records_by_rig_num(records)
+    ordered_keys = ordered_rig_num_keys(groups)
+
+    # Render
+    print(f"\n{header}")
+    flat: List[Tuple[str, WaterCalData]] = []
+    idx = 1
+
+    for g_i, g_key in enumerate(ordered_keys):
+        lst = groups[g_key]
+        print(section_title(g_key, len(lst)))
+        if not lst:
+            print(row("  └─ (no files)"))
+        else:
+            for rec in lst:
+                print(entry_line(idx, rec))
+                flat.append((g_key, rec))
+                idx += 1
+
+    print(footer)
+    print("0 (or empty) to exit")
+    return flat
+
+
+def select_index(prompt: str, max_index: int) -> Optional[int]:
+    """
+    Prompt for a number in [0..max_index]. Returns:
+      - None if invalid
+      - 0 for Exit
+      - 1..max_index for valid selection
+    """
+    choice = input(prompt).strip()
+    if not choice.isdigit():
+        return None
+    idx = int(choice)
+    if idx == 0:
+        return 0
+    if 1 <= idx <= max_index:
+        return idx
+    return None
+
+
+def prompt_volume_and_calculate(record: WaterCalData) -> None:
+    while True:
+        slope, offset, r2 = record.preferred_coefficients
+        ul_str = input("Enter a volume in microliters to calculate the valve open time in milliseconds (blank or 0 to go back): ").strip()
+        if not ul_str or ul_str == "0":
+            break
+        try:
+            microliters = float(ul_str)
+        except ValueError:
+            print("❌ Invalid number.")
+            continue
+
+        lo, hi = record.vol_bounds
+        low_vol, hi_vol = lo*1000, hi*1000
+        if microliters < low_vol or microliters > hi_vol:
+            print(f" => (❌ {microliters} is outside the calibrated range {low_vol}–{hi_vol} ms !)")
+        else:
+            print(f" => {calc_time_ms_from_vol_ul(microliters, slope, offset)} ms")
+                
+    print("(Back to list. Press 0 to exit.)") # small UX hint when returning to the list
+
+
+
+def interactive_app(main_dir: Optional[Path] = None):
+    main_dir = main_dir or DEFAULT_MAIN_DIR
+    if not main_dir.exists():
+        print(f"Path not found: {main_dir}")
+        return
+
+    records = load_watercaldata(main_dir)
+    if not records:
+        print("No water calibration information found.")
+        return
 
     while True:
-        idx = choose_from_list(
-            [f"Rig {r}  ({len(rigs_index[r])} file(s))" for r in rig_names_sorted],
-            "\n=== Select a Rig ==="
-        )
-        if idx is None:
-            print("Goodbye!")
+        flat = render_main_menu_grouped_by_rig_num(records)
+        if not flat:
+            print("No files found.")
             return
 
-        rig = rig_names_sorted[idx]
-        rig_records = rigs_index[rig]
+        choice = input("Select file: ").strip()
+        if not choice or choice == "0":# Exit or go back
+            break
+        if not choice.isdigit():
+            print("❌ Invalid selection.")
+            continue
 
-        while True:
-            print(f"\n=== Files for Rig {rig} ===")
-            for i, rec in enumerate(rig_records, 1):
-                print(f"{i:3d}) {rec.compact_line()}")
-            print("    0) Back to rigs")
+        idx = int(choice)
+        if not (1 <= idx <= len(flat)): # Out-of-range number
+            print("❌ Invalid selection.")
+            continue
 
-            choice = input("Select a file to view details: ").strip()
-            if choice == "0":
-                break
-            if not choice.isdigit():
-                print("Invalid selection. Please enter a number.")
-                continue
-            file_idx = int(choice)
-            if not (1 <= file_idx <= len(rig_records)):
-                print("Out of range. Try again.")
-                continue
-
-            selected = rig_records[file_idx - 1]
-            print("\n--- File Details ---")
-            print(selected.summary())
-
-            run = input("Run custom logic on this file? [y/N]: ").strip().lower()
-            if run == "y":
-                perform_custom_logic(selected)
-                print("[Done]\n")
+        rig_num, record = flat[idx - 1]
+        print(repr(record))
+        prompt_volume_and_calculate(record)
 
 
-# ---------- Entrypoint ----------
 if __name__ == "__main__":
-    # If user passes a path, use it; otherwise fall back to DEFAULT_MAIN_DIR.
-    # Usage examples:
-    #   python config_browser.py
-    #   python config_browser.py /custom/path/to/main_dir
     cli_dir = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else None
-    interactive_app(cli_dir)
+    try:
+        interactive_app(cli_dir)
+    except KeyboardInterrupt:
+        print("\nExiting...")
