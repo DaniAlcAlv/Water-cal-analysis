@@ -63,7 +63,7 @@ from typing import Any, Dict, List, Optional, Tuple, Annotated, Mapping
 from pydantic import BaseModel, ValidationError, field_validator, Field
 
 # ---------- Configuration ----------
-DEFAULT_MAIN_DIR = Path(r"F:\Data\Rig 2026-2-19")
+DEFAULT_MAIN_DIR = Path(r"C:\Data\Rig jsons 2026-2-19")
 MENU_WIDTH = 100 
 
 # ---------- Regression Utilities ----------
@@ -175,7 +175,7 @@ class WaterCalData:
     EQUAL_TOLERANCE = 0.005  # Tolerance for calculating if 2 numbers are the same or not
     MAX_OFFSET_SLOPE_RATIO = 20
     MIN_R2, MIN_R2_WARN = 0.980, 0.990
-    SLOPE_MIN, SLOPE_MAX = 0.04, 0.10
+    SLOPE_MIN, SLOPE_MAX = 0.04, 0.09
 
     def __init__(self, file_path: Path, raw_data: Dict[str, Any]):
         try:
@@ -354,6 +354,7 @@ class WaterCalData:
             elif math.isclose(output_weight / m.repeat_count, expected_weight, rel_tol=self.EQUAL_TOLERANCE):
                 self._warnings.add("Output error: Weight was not divided by the repeat count when calculating the interval avg")
                 self.weight_per_valve_opentime[m.valve_open_time] = expected_weight
+                print(f'"{m.valve_open_time}": {expected_weight},')
 
             elif not math.isclose(output_weight, expected_weight, rel_tol=self.EQUAL_TOLERANCE):
                 self._errors.add(
@@ -389,9 +390,9 @@ class WaterCalData:
             self._warnings.add(f"Suboptimal regression fit: r2={r2:.6f} (< {self.MIN_R2_WARN})")
 
         if abs(offset) > abs(slope) / self.MAX_OFFSET_SLOPE_RATIO:
-            self._errors.add(f"Offset value ({offset:.6f}) quite big compared to the the slope ({slope:.6f})")
+            self._errors.add(f"Offset value ({offset:.6f}) too big compared to the the slope ({slope:.6f})")
         elif abs(offset) > abs(slope) / (self.MAX_OFFSET_SLOPE_RATIO * 5):
-            self._warnings.add(f"Offset value ({offset:.6f}) too big compared to the the slope ({slope:.6f})")
+            self._warnings.add(f"Offset value ({offset:.6f}) quite big compared to the the slope ({slope:.6f})")
 
         s_range = self.SLOPE_MAX - self.SLOPE_MIN
         if self.SLOPE_MIN > slope or slope > self.SLOPE_MAX:
@@ -404,16 +405,16 @@ class WaterCalData:
             )
 
     # --- Plotting ---
-    def plot_weight_vs_opentime(self, show_slope_band: bool = True):
+    def plot_weight_vs_opentime(self, show_slope_band: bool = True, draw: bool = True):
         """
         Plot weight vs valve open time using self.weight_per_valve_opentime, with fitted regression line.
 
         Parameters
         ----------
-        save_path : str | Path | None
-            If provided, saves the figure to this path.
         show_slope_band : bool
             If True, shades y-values implied by slope bounds to visualize acceptable range.
+        draw : bool
+            If True, it will show the plot on screen.
 
         Returns
         -------
@@ -469,20 +470,21 @@ class WaterCalData:
             y_max_band = offset + self.SLOPE_MAX * x_line
             ax.fill_between(
                 x_line, y_min_band, y_max_band,
-                color="C2", alpha=0.08, label=f"Slope band [{self.SLOPE_MIN:.3f}, {self.SLOPE_MAX:.3f}]"
+                color="C2", alpha=0.08, label=f"Slope band [{self.SLOPE_MIN:.2f}, {self.SLOPE_MAX:.2f}]"
             )
 
         # --- Axis labels, title, grid and legend
-        ax.set_xlabel("Valve open time (t)", fontsize=11)
-        ax.set_ylabel("Water weight (W)", fontsize=11)
+        ax.set_xlabel("Valve open time (s)", fontsize=10)
+        ax.set_ylabel("Water (g or mL)", fontsize=10)
         title = f"{self.file_path.stem} — Weight vs Valve Open Time"
-        ax.set_title(title, fontsize=12, pad=10)
+        ax.set_title(title, fontsize=11, pad=10)
         ax.grid(True, which="both", ls="--", lw=0.6, alpha=0.35)
         ax.legend(frameon=True)
 
         # --- Tight layout and show
         fig.tight_layout()
-        plt.show()
+        
+        if draw: plt.show()
 
         return fig, ax
 
@@ -669,8 +671,6 @@ def prompt_volume_and_calculate(record: WaterCalData) -> None:
             print(f" => {calc_time_ms_from_vol_ul(microliters, slope, offset)} ms")
                 
     print("(Back to list. Press 0 to exit.)") # small UX hint when returning to the list
-
-
 
 def interactive_app(main_dir: Optional[Path] = None):
     main_dir = main_dir or DEFAULT_MAIN_DIR
