@@ -86,7 +86,7 @@ for i, rec in enumerate(filtered, 1):
     status = format_status(rec)
     date_str = rec.date.strftime("%Y-%m-%d") if rec.date else "NoDate"
 
-    title = f"{i}. {rec.file_path.stem} — {rec.rig_name} @ {rec.computer_name} [{status}]"
+    title = f"{i}. {rec.record_id} — {rec.rig_name} @ {rec.computer_name} [{status}]"
     with st.expander(title, expanded=False):
         cols = st.columns([1, 2], gap="large")
 
