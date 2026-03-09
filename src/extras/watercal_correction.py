@@ -6,9 +6,9 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-from watercal_model import WaterCalRecord
+from models.watercal_model import WaterCalRecord
 
-
+### CODE FOR REWRITING A WATERCAL JSON WITHOUT RECALCULATING THE FIT, ONLY WITH THE INTERVAL_AVG CORRECTED ###
 def _has_inconsistent_interval_average(errors: List[str]) -> bool:
     prefix = "Inconsistent interval_average"
     return any(isinstance(e, str) and e.startswith(prefix) for e in errors)
@@ -68,7 +68,6 @@ def write_corrected_water_calibration_without_recalc(
         report["status"] = "skipped"
         report["reason"] = "record_already_ok"
         return report
-
 
     iv = getattr(wv, "corrected_interval_average", None)
 

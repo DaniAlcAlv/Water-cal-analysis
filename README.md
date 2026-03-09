@@ -1,114 +1,90 @@
-# WaterCal Analysis – Overview
+# 🛠 Tool Summary
 
-## Structure
-watercal/
-├─ watercal_register.py   # Single calibration (model, validation, regression, calculator)
-├─ watercal_dataset.py    # Multi-record loader + indexing + filtering
-├─ PyGUI.py               # Terminal UI
-└─ WebGUI.py              # Streamlit Web UI
+A toolkit to load, validate, visualize, create, and update **Water Valve Calibrations** and **Spotchecks** used in VR foraging rigs.
 
+## 🎯 Purpose
+- Display rig schemas, calibrations, and spotchecks  
+- Validate calibrations (regression, consistency, aging, bounds)  
+- Create **manual calibrations entries**  
+- Create and save **spotcheck entries**  
+- Update **rig schema JSON** from any WaterCal file  
+- Visualize performance trends and errors  
 
-## Purpose
-Manages water valve calibrations and allows a calculation of:
-Volume (µL) → Valve open time (ms)
-(using regression if within calibrated range)
+## 📁 Project Structure
+src/  
+│  
+├─ CaSCaDa.py                 # Streamlit entrypoint  
+│  
+├─ config.py                  # Default paths and constants  
+│  
+├── models
+│   ├── watercal_model.py     # Calibration models and regression logic  
+│   ├── watercal_dataset.py   # Dataset loader and record indexing  
+│   └── spotcheck_model.py    # Spotcheck models and dataframe loader  
+│  
+├── services/                  
+│   ├── cache.py              # Streamlit caching helpers  
+│   ├── dataset_loader.py     # Wrappers for loading datasets  
+│   └── plotting.py           # Matplotlib → PNG conversion  
+│   
+├─ ui/      
+│   ├─ filters.py             # Sidebar filters  
+│   └─ record_block.py        # Shared calibration display UI  
+│  
+├─ pages/                     # Streamlit pages 
+│   ├─ rig_dashboard.py  
+│   ├─ watercal_dashboard.py  
+│   ├─ spotcheck_dashboard.py  
+│   ├─ new_spotcheck.py  
+│   └─ manual_calibration.py  
+│  
+├─ PyGUI.py                   # Terminal interface  
+│  
+└─ extras/                    # Other scripts
 
+## 📦 Supported WaterCal Data Layouts
+### Automatic Calibration
+*/water_calibration.json  (Contains the measurements and regression)  
+*/behavior/logs/rig_input.json  (Contains rig info) 
 
-## Supported data layouts
+### Manual Calibration
+*/water_calibration.json  (Contains the measurements and regression)   
+*/rig_info.json  (Contains rig info)   
 
-### WaterCal JSON
-If WaterCal JSON is used, rig/computer info can be taken from the input rig_json logged in the same directory.
-### Expected Layout
-main_dir/
-    any_subdir/
-        water_calibration.json 
-        behavior/logs/rig_input.json
+### Rig Schema  
+*/[computer_name]/**.json (Contains both the rig info and the water calibration data):  
 
-#### water_calibration.json Contains the calibration data:
-- measurements
-- interval_average
-- slope / offset / R²
-- date / notes
-#### behavior/logs/rig_input.json contains 
-- computer_name 
-- rig_name
+## ✔ Validation
+- JSON load & structure  
+- repeat_count ≥ 21  
+- at least 2 measurement rows  
+- interval_average consistency  
+- positive and finite values  
+- regression recomputation and thresholds  
+- calibration age checks  
 
+## 🖥 WebGUI (Streamlit)
 
-### Rig JSON
+### **Current Rig Dashboard**
+- View calibrations inside rig schemas  
+- Show errors/warnings  
+- Plot regression & intervals  
+- Update a rig’s calibration block in-place preserving all other keys and creates a .bak backup  
 
-#### Expected Layout
-rig_jsons_main_dir/
-    <computer_name>/
-        *.json  
+### **Water Calibration Dashboard**
+- Historical standalone calibrations  
+- Diagnostics + plots  
 
-#### *.json Contains:
-- computer_name
-- rig_name (ex: 5A, 12B)
-- calibration.water_valve
+### **Spotcheck Dashboard**
+- All rigs: Displays a table with data from the last calibration and spotchecks
+- Single rig: KPIs, Ratio-to-target plot, Error % timeline  plot
 
-## Capabilities
+### **New Spotcheck**
+- Allows the user to select a rig and schema to auto‑compute repeat count & valve time, and then enter delivered mass  
+- OK/Strike/Fail shown visually  
+- Save spotcheck JSON  
 
-### Loading
-- Reads all JSON files in directory tree
-- Accepts Rig JSON or WaterCal JSON
-- Skips invalid files (logged)
-- Groups records by:
-  - rig_name
-  - rig number (numeric prefix)
-  - computer_name
-
-### Filtering
-- All records
-- Valid only
-- With errors
-- With warnings
-- By rig name
-- By rig number
-- Recent calibrations
-
-### Calculator
-- Converts µL → ms
-- Checks calibrated bounds
-
-### Validation & Quality Checks
-Load / Parse
-- JSON read errors
-- Schema validation failures
-
-Schema Validation Issues
-- repeat_count ≤ 20
-- < 2 measurements
-- invalid interval_average
-- non-positive values
-
-Data Consistency
-- missing interval_average entries
-- mismatch vs measured averages
-- regression mismatch
-
-Regression Quality
-- low R²
-- abnormal slope
-- excessive offset
-
-
-## UI
-
-### PyGUI
-- Terminal menu grouped by rig #
-- Shows slope / offset / R²
-- Displays warnings/errors
-- Plot support
-- Built-in calculator
-
-### WebGUI
-- Streamlit interface
-- Interactive filtering + plotting
-
-
-## Logging
-
-Enable debug info with:
-
-import logging
-logging.basicConfig(level=logging.INFO)
+### **Manual Calibration**
+- Enter new measurements 
+- Shows diagnostics + regression plot  
+- Save the results in calibration folder

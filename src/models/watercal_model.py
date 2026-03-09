@@ -2,11 +2,15 @@
 import math
 import numpy as np
 import matplotlib.pyplot as plt
+import json
+import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Mapping, Annotated, ClassVar
 from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
+
+logger = logging.getLogger()
 
 # ---------- Regression ----------
 def linear_regression(x: List[float], y: List[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
@@ -96,7 +100,7 @@ class WaterValveCalibration(BaseModel):
       - date recency
 
     Also exposes:
-      - warnings, errors, recomputed, different_recalculated_output
+      - warnings, errors, recomputed_fit, different_recalculated_output
       - convenience helpers (preferred_coefficients, check_bounds, calc...)
       - **plot(...)** method (kept!)
     """
@@ -108,10 +112,17 @@ class WaterValveCalibration(BaseModel):
     description: Optional[str] = None
     notes: Optional[str] = None
 
+    @field_validator("date")
+    @classmethod
+    def _ensure_tzaware(cls, v: Optional[datetime]) -> Optional[datetime]:
+        if v is None:
+            return v
+        return v if v.tzinfo is not None else v.replace(tzinfo=timezone.utc)
+
     # Diagnostics / derived
     warnings: List[str] = Field(default_factory=list)
     errors: List[str] = Field(default_factory=list)
-    recomputed: Optional[RegressionResult] = None
+    recomputed_fit: Optional[RegressionResult] = None
     different_recalculated_output: bool = False
     corrected_interval_average: Dict[float, float] = Field(default_factory=dict)
 
@@ -131,7 +142,7 @@ class WaterValveCalibration(BaseModel):
     def rerun_checks(self) -> None:
         self.warnings.clear()
         self.errors.clear()
-        self.recomputed = None
+        self.recomputed_fit = None
         self.different_recalculated_output = False
         self._run_checks()
 
@@ -203,7 +214,7 @@ class WaterValveCalibration(BaseModel):
         offset_ok = math.isclose(offset, out.offset, rel_tol=self.EQUAL_TOLERANCE) if math.isfinite(offset) else False
         r2_ok    = math.isclose(r2, out.r2, abs_tol=self.EQUAL_TOLERANCE/10) if math.isfinite(r2) else False
 
-        self.recomputed = RegressionResult(
+        self.recomputed_fit = RegressionResult(
             slope=slope, offset=offset, r2=r2,
             slope_ok=slope_ok, offset_ok=offset_ok, r2_ok=r2_ok
         )
@@ -220,13 +231,8 @@ class WaterValveCalibration(BaseModel):
                 self._error(f"Offset value ({offset:.6f}) too big compared to the the slope ({slope:.6f})")
             elif abs(offset) > abs(slope) / (self.MAX_OFFSET_SLOPE_RATIO * 5):
                 self._warn(f"Offset value ({offset:.6f}) quite big compared to the the slope ({slope:.6f})")
-
             if slope < self.SLOPE_MIN or slope > self.SLOPE_MAX:
-                self._error(f"Slope value ({slope:.6f}) out of bounds ({self.SLOPE_MIN:.6f} - {self.SLOPE_MAX:.6f})")
-            else:
-                span = self.SLOPE_MAX - self.SLOPE_MIN
-                if slope < self.SLOPE_MIN + span / 5 or slope > self.SLOPE_MAX - span / 5:
-                    self._warn(f"Slope value ({slope:.6f}) close to out of bounds ({self.SLOPE_MIN:.6f} - {self.SLOPE_MAX:.6f})")
+                self._warn(f"Slope value ({slope:.6f}) out of bounds ({self.SLOPE_MIN:.6f} - {self.SLOPE_MAX:.6f})")
 
         # (D) Date recency
         dt = self.date
@@ -249,11 +255,65 @@ class WaterValveCalibration(BaseModel):
                 elif delta > warn_period:
                     self._warn(f"Calibration date is getting old: age={delta.days}days > threshold={warn_period.days}days.")
 
+    # ---- Class build ----
+    @classmethod
+    def from_input(
+        cls,
+        cal_input: WaterCalInput,
+        date: Optional[datetime] = None,
+        description: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> "WaterValveCalibration":
+        """
+        Build a WaterValveCalibration directly from measurement input.
+
+        This computes:
+        - interval_average
+        - regression (slope, offset, r2)
+
+        The normal model validation and diagnostics will still run after creation.
+        """
+
+        # ---- compute interval_average ----
+        interval_average: Dict[float, float] = {}
+
+        for m in cal_input.measurements:
+            avg_weight = sum(m.water_weight) / len(m.water_weight)
+            interval_average[m.valve_open_time] = avg_weight / m.repeat_count
+
+        interval_average = dict(sorted(interval_average.items()))
+
+        # ---- regression ----
+        xs = list(interval_average.keys())
+        ys = list(interval_average.values())
+
+        slope, offset, r2 = linear_regression(xs, ys)
+
+        if slope is None or offset is None or r2 is None:
+            raise ValueError("Unable to compute regression from provided measurements.")
+
+        # ---- construct output ----
+        output = WaterCalOutput(
+            interval_average=interval_average,
+            slope=slope,
+            offset=offset,
+            r2=r2,
+            valid_domain=list(interval_average.keys()),
+        )
+
+        return cls(
+            date=date or datetime.now(),
+            input=cal_input,
+            output=output,
+            description=description,
+            notes=notes,
+        )
+
     # ---- Convenience API on the calibration itself ----
     @property
     def preferred_coefficients(self) -> Tuple[float, float, float]:
-        if self.different_recalculated_output and self.recomputed is not None:
-            return self.recomputed.slope, self.recomputed.offset, self.recomputed.r2
+        if self.different_recalculated_output and self.recomputed_fit is not None:
+            return self.recomputed_fit.slope, self.recomputed_fit.offset, self.recomputed_fit.r2
         return self.output.slope, self.output.offset, self.output.r2
 
     def check_bounds(self, value: float, unit: str) -> tuple[bool, float, float]:
@@ -319,7 +379,7 @@ class WaterValveCalibration(BaseModel):
         ax.plot(x_line, y_line, **line_kwargs, label=f"Fit: W = {slope:.5f}·t {offset:+.5f}  (R²={r2:.3f})")
 
         # Also plot the reported regression if it differs
-        if self.different_recalculated_output and self.recomputed is not None:
+        if self.different_recalculated_output and self.recomputed_fit is not None:
             s0 = self.output.slope
             o0 = self.output.offset
             r20 = self.output.r2
@@ -355,6 +415,35 @@ class WaterValveCalibration(BaseModel):
             plt.show()
         return fig, ax
 
+    # ---- Serialization ----
+    def to_payload(self) -> dict:
+        """
+        Serialize this WaterValveCalibration to the bare 'water_valve' JSON payload
+        expected by water_calibration.json (no rig/computer envelope).
+        """
+        return {
+            "date": self.date.isoformat() if self.date else None,
+            "description": self.description,
+            "notes": self.notes,
+            "input": {
+                "measurements": [
+                    {
+                        "valve_open_interval": m.valve_open_interval,
+                        "valve_open_time": m.valve_open_time,
+                        "water_weight": m.water_weight,
+                        "repeat_count": m.repeat_count,
+                    }
+                    for m in self.input.measurements
+                ]
+            },
+            "output": {
+                "interval_average": self.output.interval_average,
+                "slope": self.output.slope,
+                "offset": self.output.offset,
+                "r2": self.output.r2,
+                "valid_domain": self.output.valid_domain,
+            },
+        }
 
 class Calibration(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -362,18 +451,18 @@ class Calibration(BaseModel):
 
 
 class WaterCalRecord(BaseModel):
-    """  Envelope that holds the calibration and identifying rig info  """
+    """  Envelope that holds the calibration data and identifying rig info  """
     model_config = ConfigDict(extra="ignore")
 
     computer_name: str
     rig_name: str
     calibration: Calibration
-    record_id: Optional[str] = "NoNameFound"
+    file_path: Optional[Path] = None  # populated when loading from file
 
     # ---- Optional: accept bare 'water_valve' payload and wrap it ----
     @model_validator(mode="before")
     @classmethod
-    def wrap_bare_water_valve_if_needed(cls, data: Any) -> Any:
+    def wrap_bare_water_valve_if_needed(cls, data: dict) -> dict:
         if not isinstance(data, dict):
             return data
         if {"computer_name", "rig_name", "calibration"}.issubset(data.keys()):
@@ -410,8 +499,8 @@ class WaterCalRecord(BaseModel):
         return len(self.warnings)
 
     @property
-    def recomputed(self) -> Optional[RegressionResult]:
-        return self.calibration.water_valve.recomputed
+    def recomputed_fit(self) -> Optional[RegressionResult]:
+        return self.calibration.water_valve.recomputed_fit
 
     @property
     def different_recalculated_output(self) -> bool:
@@ -431,7 +520,25 @@ class WaterCalRecord(BaseModel):
     def calc_milliseconds_from_microliters(self, uL: float) -> float:
         return self.calibration.water_valve.calc_milliseconds_from_microliters(uL)
 
-    # ---- Keep a `.plot(...)` on the envelope as well (delegates) ----
+    def _format_status(self) -> str:
+        n_err = len(self.errors)
+        n_warn = len(self.warnings)
+        if n_err and n_warn:
+            return f"❌ {n_err}, ⚠️ {n_warn}"
+        if n_err:
+            return f"❌ {n_err}"
+        if n_warn:
+            return f"⚠️ {n_warn}"
+        return "✅"
+
+    def label(self) -> str:
+        slope, offset, r2 = self.preferred_coefficients
+        regr_md = f" `W={slope:.5f}·t{offset:+.5f} (R²={r2:.3f})`"
+        status = self._format_status()
+        date_str = self.date.strftime("%Y-%m-%d") if self.date else "NoDate"
+        label = f"{self.rig_name} — {self.computer_name} — {status} — {date_str} — {regr_md}"
+        return label
+
     def plot(
         self,
         show_slope_band: bool = True,
@@ -443,3 +550,165 @@ class WaterCalRecord(BaseModel):
         return self.calibration.water_valve.plot(
             show_slope_band=show_slope_band, draw=draw, size=size, title=title
         )
+    
+    
+    @classmethod
+    def save_manual_calibration(
+        cls,
+        base_dir: Path | str,
+        *,
+        computer_name: str,
+        rig_name: str,
+        calibration: WaterValveCalibration,
+        record_id: Optional[str] = None,
+    ) -> Path:
+        """
+        Save a manual calibration in a folder that contains:
+          - water_calibration.json  (bare WaterValveCalibration payload)
+          - rig_info.json           (metadata with computer_name, rig_name)
+
+        The directory name will be:
+          <base_dir>/<record_id or f"{rig_name}_{YYYYMMDDTHHMMSSZ}">
+
+        Returns:
+            Path to the directory written.
+        """
+        base_dir = Path(base_dir)
+
+        # Folder name (stable if a record_id is given; else timestamped)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        folder_name = record_id or f"{rig_name}_{ts}"
+        target_dir = base_dir / folder_name
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # -- rig_info.json --
+        rig_info_path = target_dir / "rig_info.json"
+        rig_payload = {
+            "computer_name": computer_name,
+            "rig_name": rig_name,
+        }
+        with rig_info_path.open("w", encoding="utf-8") as f:
+            json.dump(rig_payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+        # -- water_calibration.json --
+        watercal_path = target_dir / "water_calibration.json"
+        watercal_payload = {
+            "date": calibration.date.isoformat() if calibration.date else None,
+            "description": calibration.description,
+            "notes": calibration.notes,
+            "input": {
+                "measurements": [
+                    {
+                        "valve_open_interval": m.valve_open_interval,
+                        "valve_open_time": m.valve_open_time,
+                        "water_weight": m.water_weight,
+                        "repeat_count": m.repeat_count,
+                    }
+                    for m in calibration.input.measurements
+                ]
+            },
+            "output": {
+                "interval_average": calibration.output.interval_average,
+                "slope": calibration.output.slope,
+                "offset": calibration.output.offset,
+                "r2": calibration.output.r2,
+                "valid_domain": calibration.output.valid_domain,
+            },
+        }
+        with watercal_path.open("w", encoding="utf-8") as f:
+            json.dump(watercal_payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+        return target_dir
+
+    @staticmethod
+    def _merge_calibration_into_document(doc: dict, cal_payload: dict) -> dict:
+        """
+        Merge the calibration payload into an existing document (preserving other keys).
+        Supports:
+        1) Bare water_valve payload at root (has 'input' and 'output')
+        2) Rig envelope at doc['calibration']['water_valve'].
+        """
+        if not isinstance(doc, dict):
+            raise ValueError("Target JSON is not an object.")
+
+        # Case 1: Bare water valve JSON (root-level input/output)
+        if "input" in doc and "output" in doc and "calibration" not in doc:
+            merged = dict(doc)  # shallow copy
+            for k in ("date", "description", "notes", "input", "output"):
+                if k in cal_payload:
+                    merged[k] = cal_payload[k]
+            return merged
+
+        # Case 2: Rig envelope with calibration.water_valve
+        cal = doc.get("calibration")
+        if isinstance(cal, dict) and isinstance(cal.get("water_valve"), dict):
+            merged = dict(doc)
+            merged_cal = dict(cal)
+            merged_wv = dict(merged_cal["water_valve"])
+            for k in ("date", "description", "notes", "input", "output"):
+                if k in cal_payload:
+                    merged_wv[k] = cal_payload[k]
+            merged_cal["water_valve"] = merged_wv
+            merged["calibration"] = merged_cal
+            return merged
+
+        # Unknown shape: do not destroy; put under known location if possible
+        # Fall back to updating/adding calibration.water_valve
+        merged = dict(doc)
+        merged.setdefault("calibration", {})
+        if not isinstance(merged["calibration"], dict):
+            merged["calibration"] = {}
+        merged["calibration"]["water_valve"] = {
+            k: v for k, v in cal_payload.items()
+        }
+        return merged
+
+
+    def update_calibration_json(
+        self,
+        new_calibration: WaterValveCalibration,
+        *,
+        target: Optional[Path] = None,
+        make_backup: bool = True,
+    ) -> Path:
+        # Resolve target JSON path
+        wc_path = Path(target) if target is not None else self.file_path
+        if wc_path is None:
+            raise FileNotFoundError("No target path provided and WaterCalRecord.file_path is not set.")
+        wc_path = Path(wc_path)
+
+        if wc_path.is_dir():
+            # default to water_calibration.json inside the provided directory
+            candidate = wc_path / "water_calibration.json"
+            if not candidate.exists():
+                raise FileNotFoundError(f"Directory '{wc_path}' does not contain water_calibration.json")
+            wc_path = candidate
+
+        # Load existing document...
+        try:
+            with wc_path.open("r", encoding="utf-8") as f:
+                doc = json.load(f)
+        except Exception as e:
+            raise IOError(f"Failed to read existing calibration JSON at {wc_path}: {e}")
+
+        # Merge only calibration bits (preserving other keys)
+        merged = self._merge_calibration_into_document(doc, new_calibration.to_payload())
+
+        # Optional: backup 
+        if make_backup:
+            bak = wc_path.with_suffix(wc_path.suffix + ".bak")
+            try:
+                with bak.open("w", encoding="utf-8") as bf:
+                    json.dump(doc, bf, ensure_ascii=False, indent=2)
+                    bf.write("\n")
+            except Exception as e:
+                logger.warning("Failed to write backup %s: %s", bak, e)  
+
+        # Write merged
+        with wc_path.open("w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+        return wc_path

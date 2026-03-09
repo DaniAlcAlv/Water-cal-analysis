@@ -9,10 +9,9 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from watercal_model import WaterCalRecord
+from models.watercal_model import WaterCalRecord
 
 logger = logging.getLogger()
-DEFAULT_MAIN_DIR = Path(r"C:\Data\Rig jsons 2026-2-19")
 
 
 def rig_sort_key(rig: Optional[str]):
@@ -35,16 +34,12 @@ class WaterCalDataset:
     """
     main_dir: Path
     records: List[WaterCalRecord] = field(default_factory=list)
-
     _by_rig_name: Dict[str, List[WaterCalRecord]] = field(default_factory=dict, init=False, repr=False)
-    _by_rig_num: Dict[str, List[WaterCalRecord]] = field(default_factory=dict, init=False, repr=False)
-    _by_computer: Dict[str, List[WaterCalRecord]] = field(default_factory=dict, init=False, repr=False)
-
     skipped_files: List[Tuple[Path, str]] = field(default_factory=list, init=False)
 
     # ---------- Construction ----------
     @classmethod
-    def load_from_rigs(cls, main_dir: Path | str = DEFAULT_MAIN_DIR) -> WaterCalDataset:
+    def load_from_rigs(cls, main_dir: Path | str) -> WaterCalDataset:
         main_dir = Path(main_dir)
         records: List[WaterCalRecord] = []
         skipped: List[Tuple[Path, str]] = []
@@ -62,7 +57,7 @@ class WaterCalDataset:
                     with rig_json_path.open("r", encoding="utf-8") as f:
                         raw = json.load(f)
                     rec = WaterCalRecord.model_validate(raw)
-                    rec.record_id = rig_json_path.stem
+                    rec.file_path = rig_json_path
                     records.append(rec)
                 except Exception as e:
                     reason = f"{type(e).__name__}: {e}"
@@ -82,13 +77,26 @@ class WaterCalDataset:
     def load_from_water_cal_dir(cls, main_path: Path | str) -> "WaterCalDataset":
         """
         Scan a directory tree for water-calibration folders:
-          Dir/(optional subdir)/<rig_name>_<date>/
-              water_calibration.json
-              behavior/Logs/rig_input.json   (for computer/rig metadata)
+          Dir/(optional subdirs)/
+              1) water_calibration.json
+              2A) behavior/Logs/rig_input.json   (for rig metadata in automatic calibrations)
+              2B) rig_info.json (alternative metadata location for manual calibrations)
 
         Returns:
             WaterCalDataset with WaterCalRecord items loaded and indexed.
         """
+
+        def _get_rig_metadata(metadata_path: Path):
+            try:
+                with metadata_path.open("r", encoding="utf-8") as rf:
+                    rig_meta = json.load(rf)
+                inferred_computer = rig_meta.get("computer_name")
+                inferred_rig = rig_meta.get("rig_name")
+                return inferred_computer, inferred_rig
+            except Exception as e:
+                logger.debug("Failed reading %s: %s", rig_input_path, e)
+                return "(unknown-computer)", "(unknown-rig)"
+
         main_dir = Path(main_path)
         records: List[WaterCalRecord] = []
         skipped: List[Tuple[Path, str]] = []
@@ -111,17 +119,14 @@ class WaterCalDataset:
                 # Try to read behavior/Logs/rig_input.json for metadata
                 rig_dir = wc_path.parent  # <rig_name>_<date>
                 rig_input_path = rig_dir / "behavior" / "Logs" / "rig_input.json"
+                rig_info_path = wc_path.parent / "rig_info.json"
                 inferred_computer = "(unknown-computer)"
                 inferred_rig = "(unknown-rig)"
 
                 if rig_input_path.exists():
-                    try:
-                        with rig_input_path.open("r", encoding="utf-8") as rf:
-                            rig_meta = json.load(rf)
-                        inferred_computer = rig_meta.get("computer_name")
-                        inferred_rig = rig_meta.get("rig_name")
-                    except Exception as e:
-                        logger.debug("Failed reading %s: %s", rig_input_path, e)
+                    inferred_computer, inferred_rig = _get_rig_metadata(rig_input_path)
+                elif rig_info_path.exists():
+                    inferred_computer, inferred_rig = _get_rig_metadata(rig_info_path)
 
                 # Provide inferred names for the WaterCalRecord "bare" case
                 # (these keys are honored by WaterCalRecord.wrap_bare_water_valve_if_needed)
@@ -130,7 +135,7 @@ class WaterCalDataset:
 
                 # Build the record (works both for bare 'input/output' and envelope)
                 rec = WaterCalRecord.model_validate(raw)
-                rec.record_id = wc_path.parent.stem
+                rec.file_path = wc_path
 
                 records.append(rec)
 
@@ -149,55 +154,22 @@ class WaterCalDataset:
         return ds
 
 
-
     # ---------- Indexing ----------
     def _build_indexes(self) -> None:
         self._by_rig_name.clear()
-        self._by_rig_num.clear()
-        self._by_computer.clear()
-
-        def extract_rig_num(rig_name: Optional[str]) -> str:
-            if not rig_name:
-                return "Other"
-            m = re.match(r"(\d+)", rig_name.strip())
-            return m.group(1) if m else "Other"
 
         for r in self.records:
-            rig_name = r.rig_name
-            rig_num = extract_rig_num(rig_name)
-
-            self._by_rig_name.setdefault(rig_name or "(missing)", []).append(r)
-            self._by_rig_num.setdefault(rig_num, []).append(r)
-            self._by_computer.setdefault(r.computer_name or "(unknown)", []).append(r)
+            self._by_rig_name.setdefault(r.rig_name or "(missing)", []).append(r)
 
         # Sort lists within indexes
         for lst in self._by_rig_name.values():
-            lst.sort(key=lambda r: (r.computer_name or "", r.record_id))
-        for lst in self._by_rig_num.values():
-            lst.sort(key=lambda r: (r.rig_name or "", r.record_id))
-        for lst in self._by_computer.values():
-            lst.sort(key=lambda r: (r.rig_name or "", r.record_id))
+            lst.sort(key=lambda r: (r.rig_name or "", r.file_path))
 
 
     # ---------- Accessors ----------
     def by_rig_name(self) -> Dict[str, List[WaterCalRecord]]:
         return {k: list(v) for k, v in self._by_rig_name.items()}
 
-    def by_rig_num(self) -> Dict[str, List[WaterCalRecord]]:
-        return {k: list(v) for k, v in self._by_rig_num.items()}
-
-    def by_computer(self) -> Dict[str, List[WaterCalRecord]]:
-        return {k: list(v) for k, v in self._by_computer.items()}
-
-    def ordered_rig_num_groups(self) -> List[Tuple[str, List[WaterCalRecord]]]:
-        keys = self._ordered_rig_num_keys(self._by_rig_num)
-        return [(k, self._by_rig_num[k]) for k in keys]
-
-    @staticmethod
-    def _ordered_rig_num_keys(groups: Dict[str, List[WaterCalRecord]]) -> List[str]:
-        numeric = [k for k in groups.keys() if k != "Other" and k.isdigit()]
-        numeric_sorted = sorted(numeric, key=lambda s: int(s))
-        return numeric_sorted + (["Other"] if "Other" in groups else [])
 
     # ---------- Filters ----------
     def all(self) -> List[WaterCalRecord]:
@@ -211,9 +183,6 @@ class WaterCalDataset:
 
     def with_warnings(self) -> List[WaterCalRecord]:
         return [r for r in self.records if r.n_warnings > 0]
-
-    def for_rig_num(self, rig_num: str) -> List[WaterCalRecord]:
-        return list(self._by_rig_num.get(rig_num, []))
 
     def for_rig_name(self, rig_name: str) -> List[WaterCalRecord]:
         return list(self._by_rig_name.get(rig_name, []))
@@ -234,5 +203,3 @@ class WaterCalDataset:
             if age <= timedelta(days=max_age_days):
                 out.append(r)
         return out
-
-

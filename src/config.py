@@ -1,0 +1,10 @@
+# config.py
+
+RIG_DIR_DEFAULT       = r"C:\Data\Rig jsons 2026-2-19"
+WATERCAL_DIR_DEFAULT  = r"C:\Data\Water-cal"
+SPOTCHECK_DIR_DEFAULT = r"C:\Data\SpotCheck"
+
+OK_MARGIN = 10.0
+STRIKE_MARGIN = 15.0
+
+DAYS_FILTER_DEFAULT = 365
