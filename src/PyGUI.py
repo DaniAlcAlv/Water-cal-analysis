@@ -7,8 +7,8 @@ import re
 from pathlib import Path
 from typing import List, Tuple, Optional
 
-from watercal_dataset import WaterCalDataset
-from watercal_model import WaterCalRecord
+from models.watercal_dataset import WaterCalDataset
+from models.watercal_model import WaterCalRecord
 
 import logging
 logging.basicConfig(
@@ -79,14 +79,14 @@ def render_main_menu(dataset: WaterCalDataset, menu_width: int = MENU_WIDTH) -> 
         if available_for_file < 10:
             available_for_file = 10
 
-        id = (rec.record_id[: available_for_file - 1] + "…") if len(rec.record_id) > available_for_file else rec.record_id
+        id = (rec.file_path.parent.stem[: available_for_file - 1] + "…") if len(rec.file_path.parent.stem) > available_for_file else (rec.file_path.parent.stem)
         file_col = f"{id:.<{available_for_file}}"
 
         # Format: Idx + file_name + flags + formula + Date
         return row(f"{idx_col}{file_col}{flags_col}{formula_col}{date_col}")
 
     # Build groups and render
-    groups = dataset.ordered_rig_num_groups()  # List[Tuple[rig_num, List[WaterCalRecord]]]
+    groups = dataset.by_rig_name()  # List[Tuple[rig_num, List[WaterCalRecord]]]
 
     print(header)
     if dataset.skipped_files:
@@ -95,7 +95,7 @@ def render_main_menu(dataset: WaterCalDataset, menu_width: int = MENU_WIDTH) -> 
 
     flat: List[Tuple[str, WaterCalRecord]] = []
     idx = 1
-    for rig_num, group in groups:
+    for rig_num, group in groups.items():
         print(section_title(rig_num, len(group)))
         if not group:
             print(row("  └─ (no files)"))
@@ -122,13 +122,14 @@ def render_record_details(rec: WaterCalRecord, width: int = MENU_WIDTH) -> str:
 
     # Coefficients
     s0, o0, r20 = rec.cal_output.slope, rec.cal_output.offset, rec.cal_output.r2
-    s1, o1, r21 = rec.recomputed.slope, rec.recomputed.offset, rec.recomputed.r2
+    s1, o1, r21 = rec.recomputed_fit.slope, rec.recomputed_fit.offset, rec.recomputed_fit.r2
     date_str = rec.date.strftime("%Y-%m-%d") if rec.date else "NoDate"
 
     lines = [
         header,
         row(f"File: {rec.rig_name}"),
         row(f"Date: {date_str}"),
+        row(f"Path: {rec.file_path}"),
         f"├{'─'*(width-2)}┤",
         row(f"Original:   slope {s0:>9.6f}    offset {o0:>9.6f}     R² {r20:>5.3f}"),
         row(f"Recomputed: slope {s1:>9.6f}    offset {o1:>9.6f}     R² {r21:>5.3f}"),
@@ -174,9 +175,8 @@ def prompt_volume_and_calculate(record: WaterCalRecord) -> None:
 
 # ---------- App ----------
 def interactive_app(main_dir: Optional[Path] = None):
-    # main_dir = main_dir or Path(".")
-    # dataset = WaterCalDataset.load_from_rigs(main_dir)
-    dataset = WaterCalDataset.load_from_water_cal_dir(r"C:\Data\Water-cal")
+    main_dir = main_dir or Path(".")
+    dataset = WaterCalDataset.load_from_rigs(main_dir)
 
     if not dataset.records:
         print("No water calibration information found.")
