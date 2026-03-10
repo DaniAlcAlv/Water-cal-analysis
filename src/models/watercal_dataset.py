@@ -144,6 +144,39 @@ class WaterCalDataset:
                 skipped.append((wc_path, reason))
                 logger.warning("Skipping %s — %s", wc_path, reason)
 
+
+        old_wc_files = sorted(main_dir.rglob("*water_valve_calibration*.json"))
+        print(main_dir," - ", old_wc_files)
+        for old_wc_path in old_wc_files:
+            print("loading old file", old_wc_path)
+            try:
+                # Load the water_calibration payload
+                with old_wc_path.open("r", encoding="utf-8") as f:
+                    raw = json.load(f)
+
+                # Try to read behavior/Logs/rig_input.json for metadata
+                inferred_computer = "(unknown-computer)"
+                try:
+                    inferred_rig = old_wc_path.stem.split("_")[0]
+                except:
+                    inferred_rig = "(unknown-rig)"
+
+                # Provide inferred names for the WaterCalRecord "bare" case
+                # (these keys are honored by WaterCalRecord.wrap_bare_water_valve_if_needed)
+                raw.setdefault("_inferred_computer_name", inferred_computer)
+                raw.setdefault("_inferred_rig_name", inferred_rig)
+
+                # Build the record (works both for bare 'input/output' and envelope)
+                rec = WaterCalRecord.model_validate(raw)
+                rec.file_path = wc_path
+
+                records.append(rec)
+
+            except Exception as e:
+                reason = f"{type(e).__name__}: {e}"
+                skipped.append((wc_path, reason))
+                logger.warning("Skipping %s — %s", wc_path, reason)
+
         ds = cls(main_dir=main_dir, records=records)
         ds.skipped_files = skipped
         ds._build_indexes()
