@@ -11,7 +11,7 @@ def render_record_block(i: int, rec: WaterCalRecord):
     """Shared detail + plot block for a single record."""
 
     with st.expander(rec.label(), expanded=False):
-        cols = st.columns([2, 3])
+        cols = st.columns([2, 3], vertical_alignment='center')
 
         with cols[0]:
             # Path
@@ -53,14 +53,14 @@ def show_skipped_files(rig_ds:WaterCalDataset, wcal_ds:WaterCalDataset):
     """Added a skipped files info (both datasets if available)"""
     with st.expander("Files unable to load", expanded=True):
         if rig_ds.skipped_files:
-            with st.sidebar.expander(f"Rigs - Skipped files: {len(rig_ds.skipped_files)}", expanded=False):
+            with st.expander(f"Rigs - Skipped files: {len(rig_ds.skipped_files)}", expanded=False):
                 for p, reason in rig_ds.skipped_files[:20]:
                     st.write(f"- `{p}` — {reason}")
                 if len(rig_ds.skipped_files) > 20:
                     st.caption(f"... and {len(rig_ds.skipped_files) - 20} more")
 
         if wcal_ds.skipped_files:
-            with st.sidebar.expander(f"WaterCal - Skipped files: {len(wcal_ds.skipped_files)}", expanded=False):
+            with st.expander(f"WaterCal - Skipped files: {len(wcal_ds.skipped_files)}", expanded=False):
                 for p, reason in wcal_ds.skipped_files[:20]:
                     st.write(f"- `{p}` — {reason}")
                 if len(wcal_ds.skipped_files) > 20:

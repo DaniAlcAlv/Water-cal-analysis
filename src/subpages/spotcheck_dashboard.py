@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 from config import STRIKE_MARGIN, OK_MARGIN
-from ui_helpers.blocks import fig_to_png  
+from services.cache import fig_to_png  
 
 
 

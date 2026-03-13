@@ -8,14 +8,9 @@ import pandas as pd #Only for Typehints
 
 from services.filesystem import find_repo_root
 from models.watercal_dataset import WaterCalDataset
-from ui_helpers.blocks import show_skipped_files
+from ui.blocks import show_skipped_files
 
 def show_launcher(rig_ds: WaterCalDataset, wcal_ds: WaterCalDataset, spotcheck_df: pd.DataFrame, spotcheck_path:str, page_options: list) -> None:
-    st.set_page_config(
-        page_title="💧 CaSCaDa Dashboard",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
 
     logging.basicConfig(
         level=logging.INFO,
@@ -23,8 +18,9 @@ def show_launcher(rig_ds: WaterCalDataset, wcal_ds: WaterCalDataset, spotcheck_d
     )
 
     # ---- Main title ----
-    st.title("CaSCaDa")
-    st.write("Calibration and Spot Check assistance Dashboard")
+    t1, t2 = st.columns([1, 2], vertical_alignment='bottom', border=False) 
+    with t1: st.markdown("# CaSCaDa")
+    with t2: st.markdown("## Calibration and Spot Check assistance Dashboard")
     st.divider()
 
     # ---- Access to other pages ----
@@ -54,14 +50,14 @@ def show_launcher(rig_ds: WaterCalDataset, wcal_ds: WaterCalDataset, spotcheck_d
 
 
     # ---- Status summary ----
-    st.markdown("#### 📊 Data Successfully Loaded")
+    st.markdown("#### 📊 Loaded data:")
     path_cols = st.columns(3)
     with path_cols[0]:
         st.metric("Rig schemas", f"{len(rig_ds.records)} files")
         st.caption(f"`{rig_ds.main_dir}`")
 
     with path_cols[1]:
-        st.metric("WaterCal calibrations", f"{len(wcal_ds.records)} files")
+        st.metric("Water Calibration records", f"{len(wcal_ds.records)} files")
         st.caption(f"`{wcal_ds.main_dir}`")
 
     with path_cols[2]:

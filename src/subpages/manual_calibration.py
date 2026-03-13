@@ -14,11 +14,6 @@ from services.cache import fig_to_png
 
 
 def render_manual_calibration(rig_ds:WaterCalDataset, rig_filter:str):
-    st.set_page_config(
-        page_title="✍️ Manual Calibration",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
 
     st.title("✍️ Manual Calibration")
 

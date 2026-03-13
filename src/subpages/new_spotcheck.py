@@ -19,13 +19,13 @@ def render_new_spotcheck(rig_ds:WaterCalDataset, spotcheck_path:Path|str, rig_fi
     # Use the rig selected in the sidebar
     sel_rig = rig_filter
     spotcheck_path = Path(spotcheck_path)
+    st.title("➕ New Spotcheck")
 
-    col_rig, col_cal, col_plot = st.columns([1, 1, 1])
+    col_rig, col_cal, col_plot = st.columns([2, 3, 3], vertical_alignment='center')
     with col_rig:
-        st.title("➕ New Spotcheck")
         st.metric(label="Selected Rig", help = "Use sidebar to select another", value=f"{sel_rig}")
         if sel_rig == "All":
-            st.error("Select a specific rig")
+            st.error("Select a specific rig on the sidebar")
             st.stop()
 
     # Build candidate calibrations for this rig to select one for the spotcheck
@@ -36,12 +36,10 @@ def render_new_spotcheck(rig_ds:WaterCalDataset, spotcheck_path:Path|str, rig_fi
     elif len(candidates) == 1:
         rec = candidates[0]
         with col_cal:
-            st.title("")
             st.markdown(f"Only one schema found for rig `{sel_rig}`:") 
             st.markdown(f"**{rec.label()}**")
     else: 
         with col_cal:
-            st.title("")
             selected_idx = st.selectbox(
                 "Schema",
                 options=list(range(len(candidates))),

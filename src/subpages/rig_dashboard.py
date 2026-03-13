@@ -7,7 +7,7 @@ import streamlit as st
 from models.watercal_model import WaterCalRecord
 from models.watercal_dataset import WaterCalDataset
 
-from ui_helpers.blocks import render_record_block
+from ui.blocks import render_record_block
 from services.filters import apply_filters
 from services.dataset_loader import reload_datasets
 

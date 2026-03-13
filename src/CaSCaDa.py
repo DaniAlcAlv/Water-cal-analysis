@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 import streamlit as st
 
 from config import *
-from ui_helpers.sidebar import render_filters
+from ui.sidebar import render_filters
+from ui.page_config import set_page_config
 from services.dataset_loader import load_datasets, reload_datasets
 
 from subpages.rig_dashboard import render_rig_dashboard
@@ -19,7 +19,8 @@ from subpages.manual_calibration import render_manual_calibration
 from subpages.launcher import show_launcher
 
 # ----------- Page Config & Logging -----------
-st.set_page_config(page_title="💧 Water Calibration Dashboard", layout="wide")
+set_page_config("CaSCaDa")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",

@@ -4,7 +4,7 @@ from __future__ import annotations
 import streamlit as st
 
 from services.filters import apply_filters
-from ui_helpers.blocks import render_record_block
+from ui.blocks import render_record_block
 
 def render_watercal_dashboard(wcal_ds, rig_filter, recent_days) -> None:
 
